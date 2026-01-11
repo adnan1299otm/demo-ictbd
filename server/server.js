@@ -3,7 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const pool = require('./db');
-const { getAIResponse, summarizeConversation } = require('./ai');
+const { handleAIMessage } = require('./ai');
 const cron = require('node-cron');
 require('dotenv').config();
 
@@ -122,35 +122,34 @@ io.on('connection', (socket) => {
             if (conv.handled_by === 'ai') {
                 // 3. Get AI Response
                 // Fetch recent history for context
-                const history = await pool.query(
-                    "SELECT sender, content FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
-                    [conversationId]
-                );
+               
+                const aiText = await handleAIMessage(content);
 
-                const { text, needsHuman } = await getAIResponse(history.rows, content);
+// Rule: DB-based AI যদি উত্তর না পায় → support দরকার
+const needsHuman =
+    aiText === "This information is not available at the moment.";
 
-                if (needsHuman) {
-                    // Update DB to needs_human
-                    await pool.query("UPDATE conversations SET needs_human = true WHERE id = $1", [conversationId]);
+if (needsHuman) {
+    await pool.query(
+        "UPDATE conversations SET needs_human = true WHERE id = $1",
+        [conversationId]
+    );
 
-                    // Helper message from system/AI about handoff
-                    const aiMsgResult = await pool.query(
-                        "INSERT INTO messages (conversation_id, sender, content) VALUES ($1, 'ai', $2) RETURNING *",
-                        [conversationId, text]
-                    );
-                    io.to(conversationId).emit('message', aiMsgResult.rows[0]);
+    const aiMsgResult = await pool.query(
+        "INSERT INTO messages (conversation_id, sender, content) VALUES ($1, 'ai', $2) RETURNING *",
+        [conversationId, aiText]
+    );
+    io.to(conversationId).emit('message', aiMsgResult.rows[0]);
 
-                    // Notify Support Dashboard (via a global room or general emit)
-                    io.emit('support_update');
+    io.emit('support_update');
+} else {
+    const aiMsgResult = await pool.query(
+        "INSERT INTO messages (conversation_id, sender, content) VALUES ($1, 'ai', $2) RETURNING *",
+        [conversationId, aiText]
+    );
+    io.to(conversationId).emit('message', aiMsgResult.rows[0]);
+}
 
-                } else {
-                    // Normal AI Response
-                    const aiMsgResult = await pool.query(
-                        "INSERT INTO messages (conversation_id, sender, content) VALUES ($1, 'ai', $2) RETURNING *",
-                        [conversationId, text]
-                    );
-                    io.to(conversationId).emit('message', aiMsgResult.rows[0]);
-                }
             } else {
                 // Handled by human - do nothing (wait for support reply)
                 // Just notify support dashboard that a new message arrived
@@ -194,8 +193,8 @@ cron.schedule('0 0 * * *', async () => {
     for (const row of res.rows) {
         const msgs = await pool.query("SELECT * FROM messages WHERE conversation_id = $1", [row.id]);
         if (msgs.rows.length > 0) {
-            const summary = await summarizeConversation(msgs.rows);
-            await pool.query("UPDATE conversations SET summary = $1, updated_at = NOW() WHERE id = $2", [summary, row.id]);
+            // const summary = await summarizeConversation(msgs.rows);
+            // await pool.query("UPDATE conversations SET summary = $1, updated_at = NOW() WHERE id = $2", [summary, row.id]);
             await pool.query("DELETE FROM messages WHERE conversation_id = $1", [row.id]);
         }
     }
